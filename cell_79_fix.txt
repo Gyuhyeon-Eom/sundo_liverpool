@@ -1,0 +1,252 @@
+# ===========================================================
+# 심야 노선 설계 - 코리도 기반 5개 (car_link 직접 사용)
+# ===========================================================
+#
+# 핵심 변경: geometry를 조합하지 않고, 사용된 link_id를 저장.
+# 시각화 시 car_link GeoDataFrame에서 해당 링크만 필터 → .plot()
+# → car_link 원본 geometry 그대로 → 확실히 도로 위에 그려짐
+#
+print('=== 심야 노선 설계 (코리도 + car_link 직접 사용) ===')
+
+stop_coords_arr = np.column_stack([bus_stops_shp.geometry.x.values, bus_stops_shp.geometry.y.values])
+stop_tree_night = cKDTree(stop_coords_arr)
+
+if 'node_tree' not in dir():
+    node_ids_list = list(G_car.nodes())
+    node_coords_arr = np.array([(G_car.nodes[n].get('x',0), G_car.nodes[n].get('y',0)) for n in node_ids_list])
+    node_tree = cKDTree(node_coords_arr)
+else:
+    node_ids_list = list(G_car.nodes())
+
+# *** FIX: car_link LENGTH를 숫자로 변환 ***
+car_link['LENGTH'] = pd.to_numeric(car_link['LENGTH'], errors='coerce').fillna(0)
+
+# car_link LINK_ID → index 매핑 (str 통일)
+car_link['_LINK_ID_STR'] = car_link['LINK_ID'].astype(str)
+car_link['_ST_STR'] = car_link['ST_ND_ID'].astype(str)
+car_link['_ED_STR'] = car_link['ED_ND_ID'].astype(str)
+
+# (ST, ED) → LINK_ID 딕셔너리
+print('노드쌍 → LINK_ID 인덱스 구축...')
+st_ed_to_linkid = {}
+for idx_row, row in car_link.iterrows():
+    st, ed, lid = row['_ST_STR'], row['_ED_STR'], row['_LINK_ID_STR']
+    st_ed_to_linkid[(st, ed)] = lid
+    st_ed_to_linkid[(ed, st)] = lid
+print(f'  매핑 수: {len(st_ed_to_linkid):,}')
+
+# 디버깅: G_car edge의 link_id 형식 확인
+sample_edges = list(G_car.edges(data=True))[:5]
+print(f'\nG_car edge 샘플:')
+for u, v, d in sample_edges:
+    print(f'  ({u}, {v}): link_id={d.get("link_id","없음")}, weight={d.get("weight",0):.0f}')
+
+sample_link_ids = [d.get('link_id','') for _,_,d in sample_edges if 'link_id' in d]
+if sample_link_ids:
+    print(f'  edge link_id 타입: {type(sample_link_ids[0])}, 예: {sample_link_ids[0]}')
+print(f'  car_link LINK_ID 타입: {car_link["LINK_ID"].dtype}, 예: {car_link["LINK_ID"].iloc[0]}')
+
+
+def get_road_link_ids(path_nodes):
+    """
+    최단경로 노드 리스트 → 사용된 car_link의 LINK_ID 리스트 반환
+    (geometry 변환 없음, ID만 수집)
+    """
+    link_ids = []
+    matched = 0
+    total = len(path_nodes) - 1
+
+    for i in range(total):
+        nd_a = str(path_nodes[i])
+        nd_b = str(path_nodes[i + 1])
+
+        # 방법 1: 노드쌍 딕셔너리
+        lid = st_ed_to_linkid.get((nd_a, nd_b))
+
+        # 방법 2: G_car edge의 link_id
+        if lid is None:
+            edge = G_car.get_edge_data(nd_a, nd_b)
+            if edge and 'link_id' in edge:
+                lid = str(edge['link_id'])
+            else:
+                edge = G_car.get_edge_data(nd_b, nd_a)
+                if edge and 'link_id' in edge:
+                    lid = str(edge['link_id'])
+
+        if lid:
+            link_ids.append(lid)
+            matched += 1
+
+    return link_ids, matched, total
+
+
+def build_road_path_v2(stop_a_xy, stop_b_xy):
+    """
+    두 정류소 사이 도로 경로.
+    반환: (link_id_list, length_m, matched_count, total_edges)
+    """
+    _, a_idx = node_tree.query(stop_a_xy)
+    _, b_idx = node_tree.query(stop_b_xy)
+    a_node, b_node = node_ids_list[a_idx], node_ids_list[b_idx]
+
+    if a_node == b_node:
+        return [], 0, 0, 0
+
+    for src, dst in [(a_node, b_node), (b_node, a_node)]:
+        try:
+            path = nx.shortest_path(G_car, src, dst, weight='weight')
+            length = nx.shortest_path_length(G_car, src, dst, weight='weight')
+            link_ids, matched, total = get_road_link_ids(path)
+            return link_ids, length, matched, total
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+    return None, None, 0, 0
+
+
+# === 코리도 기반 노선 설계 ===
+N_ROUTES = 5
+MAX_STOPS = 12
+MAX_LENGTH = 20000
+SEARCH_RADIUS = 5000
+
+used_clusters = set()
+proposed_routes = []
+
+total_link_matched = 0
+total_link_edges = 0
+
+for route_idx in range(N_ROUTES):
+    route_name = f'심야신설{route_idx+1}호'
+
+    available = cluster_info[~cluster_info['cluster'].isin(used_clusters)]
+    if len(available) == 0:
+        break
+
+    seed = available.iloc[0]
+    _, seed_stop_idx = stop_tree_night.query([seed['중심X'], seed['중심Y']])
+    seed_stop = bus_stops_shp.iloc[seed_stop_idx]
+
+    route_stops = [{
+        'bstopid': str(seed_stop['bstopid']),
+        'bstopnm': seed_stop['bstopnm'],
+        'x': seed_stop.geometry.x, 'y': seed_stop.geometry.y,
+        '수요': seed['총수요'], '유형': '주요'
+    }]
+    route_clusters_used = {seed['cluster']}
+    route_link_ids = []  # 이 노선이 사용하는 모든 car_link LINK_ID
+    route_length = 0
+
+    current_x, current_y = seed_stop.geometry.x, seed_stop.geometry.y
+
+    print(f'\n{"="*50}')
+    print(f'{route_name} - 시드: {seed_stop["bstopnm"]}')
+
+    for step in range(MAX_STOPS - 1):
+        candidates = cluster_info[
+            ~cluster_info['cluster'].isin(used_clusters | route_clusters_used)
+        ].copy()
+        if len(candidates) == 0:
+            break
+
+        candidates['dist'] = np.sqrt(
+            (candidates['중심X'] - current_x)**2 +
+            (candidates['중심Y'] - current_y)**2
+        )
+        candidates = candidates[candidates['dist'] <= SEARCH_RADIUS]
+        if len(candidates) == 0:
+            break
+
+        candidates['score'] = candidates['총수요'] / (candidates['dist'] / 1000 + 0.5)
+        best = candidates.sort_values('score', ascending=False).iloc[0]
+
+        _, next_idx = stop_tree_night.query([best['중심X'], best['중심Y']])
+        next_stop = bus_stops_shp.iloc[next_idx]
+
+        link_ids, seg_length, matched, total = build_road_path_v2(
+            (current_x, current_y),
+            (next_stop.geometry.x, next_stop.geometry.y)
+        )
+
+        if link_ids is None:
+            route_clusters_used.add(best['cluster'])
+            continue
+
+        if route_length + seg_length > MAX_LENGTH:
+            break
+
+        route_link_ids.extend(link_ids)
+        route_length += seg_length
+        route_clusters_used.add(best['cluster'])
+        total_link_matched += matched
+        total_link_edges += total
+
+        route_stops.append({
+            'bstopid': str(next_stop['bstopid']),
+            'bstopnm': next_stop['bstopnm'],
+            'x': next_stop.geometry.x, 'y': next_stop.geometry.y,
+            '수요': best['총수요'], '유형': '주요'
+        })
+
+        current_x, current_y = next_stop.geometry.x, next_stop.geometry.y
+        match_pct = f'{matched}/{total}' if total > 0 else '-'
+        print(f'  +{next_stop["bstopnm"]} ({seg_length/1000:.1f}km, 링크매칭 {match_pct})')
+
+    # 경유 정류소: 링크 geometry를 따라 2km 간격 스냅
+    waypoint_stops = []
+    used_stop_ids = set(s['bstopid'] for s in route_stops)
+
+    # 링크별 경유 정류소 추가
+    route_links_gdf = car_link[car_link['_LINK_ID_STR'].isin(route_link_ids)]
+    if len(route_links_gdf) > 0:
+        # 링크들의 중간 지점에서 정류소 스냅
+        cum_dist = 0
+        last_snap = 0
+        for _, link_row in route_links_gdf.iterrows():
+            # *** FIX: LENGTH를 float로 명시적 변환 ***
+            link_len = float(link_row['LENGTH']) if pd.notna(link_row.get('LENGTH')) and link_row['LENGTH'] != '' else link_row.geometry.length
+            cum_dist += link_len
+
+            if cum_dist - last_snap >= 2000:
+                mid_pt = link_row.geometry.interpolate(0.5, normalized=True)
+                _, snap_idx = stop_tree_night.query([mid_pt.x, mid_pt.y])
+                snap = bus_stops_shp.iloc[snap_idx]
+                snap_dist = np.sqrt((snap.geometry.x - mid_pt.x)**2 + (snap.geometry.y - mid_pt.y)**2)
+                sid = str(snap['bstopid'])
+
+                if snap_dist <= 400 and sid not in used_stop_ids:
+                    waypoint_stops.append({
+                        'bstopid': sid, 'bstopnm': snap['bstopnm'],
+                        'x': snap.geometry.x, 'y': snap.geometry.y,
+                        '수요': 0, '유형': '경유'
+                    })
+                    used_stop_ids.add(sid)
+                    last_snap = cum_dist
+
+    all_stops = pd.DataFrame(route_stops + waypoint_stops)
+    used_clusters |= route_clusters_used
+
+    result = {
+        'name': route_name,
+        'link_ids': route_link_ids,  # ★ geometry 대신 link_id 리스트!
+        'length_km': route_length / 1000,
+        'key_stops': pd.DataFrame(route_stops),
+        'all_stops': all_stops,
+        'n_key': len(route_stops),
+        'n_total': len(all_stops),
+        'n_links': len(route_link_ids)
+    }
+    proposed_routes.append(result)
+
+    print(f'  => {result["length_km"]:.1f}km, {result["n_key"]}주요+{len(waypoint_stops)}경유, {len(route_link_ids)}링크')
+
+# 디버깅 요약
+print(f'\n=== 링크 매칭 진단 ===')
+if total_link_edges > 0:
+    print(f'전체 edge 중 링크 매칭: {total_link_matched}/{total_link_edges} ({total_link_matched/total_link_edges*100:.1f}%)')
+else:
+    print('경로 edge 없음')
+
+print(f'\n=== 노선 요약 ===')
+for pr in proposed_routes:
+    print(f'{pr["name"]}: {pr["length_km"]:.1f}km, {pr["n_total"]}정류소, {pr["n_links"]}링크')
